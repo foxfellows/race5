@@ -40,6 +40,28 @@
     min-height: 100vh;
     min-height: -webkit-fill-available;
   }
+  /* ── Sync status bar ── */
+  .sync-bar {
+    background: var(--surface2);
+    border-bottom: 1px solid var(--border);
+    padding: 6px 16px;
+    font-size: 11px;
+    color: var(--text3);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 28px;
+  }
+  .sync-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--text3);
+    flex-shrink: 0;
+    transition: background 0.3s;
+  }
+  .sync-dot.synced { background: var(--green); }
+  .sync-dot.syncing { background: #f59e0b; animation: pulse 1s infinite; }
+  .sync-dot.error { background: var(--red); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
   /* ── Header ── */
   .header {
     background: var(--accent);
@@ -80,7 +102,7 @@
     cursor: pointer; white-space: nowrap; flex-shrink: 0;
   }
   .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-  /* ── Race Cards (mobile) ── */
+  /* ── Race Cards ── */
   .race-list { padding: 0 16px; display: flex; flex-direction: column; gap: 10px; padding-bottom: calc(var(--safe-bottom) + 80px); }
   .race-card {
     background: var(--surface); border-radius: 14px;
@@ -159,6 +181,7 @@
     flex: 2; padding: 14px; border-radius: 12px; border: none;
     background: var(--accent); color: #fff; font-size: 16px; font-weight: 700; cursor: pointer;
   }
+  .btn-save:disabled { opacity: 0.5; cursor: not-allowed; }
   /* ── Confirm dialog ── */
   .confirm-box {
     background: var(--surface); border-radius: 14px; padding: 24px 20px;
@@ -182,9 +205,18 @@
   .legend { display: flex; gap: 14px; padding: 0 16px 14px; flex-wrap: wrap; }
   .legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text3); }
   .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+  /* ── Loading skeleton ── */
+  .loading-state { text-align: center; padding: 60px 32px; color: var(--text3); }
+  .loading-spinner { font-size: 32px; margin-bottom: 12px; animation: spin 1s linear infinite; display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
+
+<div class="sync-bar" id="syncBar">
+  <div class="sync-dot" id="syncDot"></div>
+  <span id="syncMsg">Connecting to cloud…</span>
+</div>
 
 <div class="header">
   <div class="header-inner">
@@ -228,7 +260,12 @@
   <div class="legend-item"><span style="background:var(--gold-bg);color:var(--gold);font-size:10px;font-weight:800;padding:1px 5px;border-radius:4px">PR</span> Personal record</div>
 </div>
 
-<div class="race-list" id="raceList"></div>
+<div class="race-list" id="raceList">
+  <div class="loading-state">
+    <div class="loading-spinner">⟳</div>
+    <div style="font-size:14px;color:var(--text2);font-weight:600">Loading your races…</div>
+  </div>
+</div>
 
 <button class="fab" onclick="openForm()" title="Add race">+</button>
 
@@ -295,7 +332,7 @@
 
     <div class="modal-footer">
       <button class="btn-cancel" onclick="closeForm()">Cancel</button>
-      <button class="btn-save" onclick="saveRace()">Save race</button>
+      <button class="btn-save" id="btnSave" onclick="saveRace()">Save race</button>
     </div>
   </div>
 </div>
@@ -312,22 +349,58 @@
   </div>
 </div>
 
-<script>
-const STORAGE_KEY = 'race_log_v2';
-const DISTANCES = ['5K','10K','Half Marathon','8K','15K','10 Mile','4 Mile','Other'];
+<!-- Firebase SDKs -->
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import {
+  getFirestore, collection, addDoc, updateDoc, deleteDoc,
+  doc, onSnapshot, query, orderBy
+} from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 
+const firebaseConfig = {
+  apiKey: "AIzaSyBJaR-nKfqu8aKwHwM3dZU7jzvPhfQ_tGU",
+  authDomain: "race-track-5.firebaseapp.com",
+  projectId: "race-track-5",
+  storageBucket: "race-track-5.firebasestorage.app",
+  messagingSenderId: "958581916336",
+  appId: "1:958581916336:web:6828969494323d7f203175",
+  measurementId: "G-ZQ9YZ7E9X2"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const racesCol = collection(db, 'races');
+
+const DISTANCES = ['5K','10K','Half Marathon','8K','15K','10 Mile','4 Mile','Other'];
 let races = [];
 let editId = null;
-let deleteId = null;
+let editDocId = null;
+let deleteDocId = null;
 let filterDist = 'All';
 
-// ── Persistence ──
-function load() {
-  try { races = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { races = []; }
+// ── Sync status ──
+function setSyncStatus(state, msg) {
+  const dot = document.getElementById('syncDot');
+  const label = document.getElementById('syncMsg');
+  dot.className = 'sync-dot ' + state;
+  label.textContent = msg;
 }
-function save() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(races));
-}
+
+// ── Real-time listener ──
+const q = query(racesCol, orderBy('createdAt', 'desc'));
+onSnapshot(q,
+  snapshot => {
+    races = snapshot.docs.map(d => ({ ...d.data(), _docId: d.id }));
+    setSyncStatus('synced', `Synced · ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`);
+    render();
+  },
+  err => {
+    console.error(err);
+    setSyncStatus('error', 'Sync error — check connection');
+  }
+);
+
+setSyncStatus('syncing', 'Connecting to cloud…');
 
 // ── Time helpers ──
 function timeToSec(t) {
@@ -356,7 +429,6 @@ function placeColor(ratio) {
   return 'var(--text2)';
 }
 
-// ── Distance badge colors ──
 const DIST_STYLE = {
   '5K':           'background:var(--green-bg);color:var(--green)',
   '10K':          'background:var(--blue-bg);color:var(--blue)',
@@ -364,17 +436,15 @@ const DIST_STYLE = {
 };
 function distStyle(d) { return DIST_STYLE[d] || 'background:var(--gray-bg);color:var(--text2)'; }
 
-// ── PR map ──
 function buildPRMap() {
   const m = {};
   races.forEach(r => {
     const s = timeToSec(r.time);
-    if (s && (!m[r.distance] || s < m[r.distance].s)) m[r.distance] = { id: r.id, s };
+    if (s && (!m[r.distance] || s < m[r.distance].s)) m[r.distance] = { docId: r._docId, s };
   });
   return m;
 }
 
-// ── Medal emoji ──
 function medal(n) {
   if (n === 1) return '🥇 ';
   if (n === 2) return '🥈 ';
@@ -386,11 +456,9 @@ function medal(n) {
 function render() {
   const prMap = buildPRMap();
 
-  // Counts
   document.getElementById('raceCount').textContent = `${races.length} ${races.length===1?'race':'races'} tracked`;
   document.getElementById('statTotal').textContent = races.length;
 
-  // PR cards
   function setStatCard(dist, valId, subId) {
     const best = races.filter(r=>r.distance===dist).sort((a,b)=>(timeToSec(a.time)||Infinity)-(timeToSec(b.time)||Infinity))[0];
     document.getElementById(valId).textContent = best ? (best.time || '—') : '—';
@@ -400,18 +468,16 @@ function render() {
   setStatCard('10K','stat10k','stat10kSub');
   setStatCard('Half Marathon','statHalf','statHalfSub');
 
-  // Filters
   const distOptions = ['All', ...DISTANCES.filter(d => races.some(r=>r.distance===d))];
   if (!distOptions.includes(filterDist)) filterDist = 'All';
   document.getElementById('filters').innerHTML = distOptions.map(d =>
     `<button class="filter-btn ${d===filterDist?'active':''}" onclick="setFilter('${d}')">${d==='Half Marathon'?'Half':d}</button>`
   ).join('');
 
-  // Filtered + sorted
   let data = filterDist === 'All' ? [...races] : races.filter(r=>r.distance===filterDist);
   data.sort((a,b) => {
     const ad = a.date || String(a.year||''), bd = b.date || String(b.year||'');
-    return bd.localeCompare(ad); // newest first
+    return bd.localeCompare(ad);
   });
 
   const list = document.getElementById('raceList');
@@ -425,7 +491,7 @@ function render() {
   }
 
   list.innerHTML = data.map(r => {
-    const isPR = prMap[r.distance]?.id === r.id && races.filter(x=>x.distance===r.distance).length > 1;
+    const isPR = prMap[r.distance]?.docId === r._docId && races.filter(x=>x.distance===r.distance).length > 1;
     const dateStr = r.date ? new Date(r.date+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}) : (r.year || '');
     const overallRatio = placeRatio(r.overall);
     const sexRatio = placeRatio(r.sex);
@@ -442,47 +508,29 @@ function render() {
         <span class="dist-badge" style="${distStyle(r.distance)}">${r.distance}</span>
       </div>
       <div class="race-stats">
-        <div class="race-stat">
-          <div class="race-stat-label">Time</div>
-          <div class="race-stat-value">${r.time||'—'}</div>
-        </div>
-        <div class="race-stat">
-          <div class="race-stat-label">Pace/mi</div>
-          <div class="race-stat-value">${r.pace?r.pace+'/mi':'—'}</div>
-        </div>
-        <div class="race-stat">
-          <div class="race-stat-label">Year</div>
-          <div class="race-stat-value">${r.year||'—'}</div>
-        </div>
+        <div class="race-stat"><div class="race-stat-label">Time</div><div class="race-stat-value">${r.time||'—'}</div></div>
+        <div class="race-stat"><div class="race-stat-label">Pace/mi</div><div class="race-stat-value">${r.pace?r.pace+'/mi':'—'}</div></div>
+        <div class="race-stat"><div class="race-stat-label">Year</div><div class="race-stat-value">${r.year||'—'}</div></div>
       </div>
       <div class="places-row">
-        <div class="place-cell">
-          <div class="place-label">Overall</div>
-          <div class="place-value" style="color:${placeColor(overallRatio)}">${medal(overallN)}${r.overall||'—'}</div>
-        </div>
-        <div class="place-cell">
-          <div class="place-label">Sex</div>
-          <div class="place-value" style="color:${placeColor(sexRatio)}">${r.sex||'—'}</div>
-        </div>
-        <div class="place-cell">
-          <div class="place-label">Age group</div>
-          <div class="place-value" style="color:${placeColor(ageRatio)}">${r.age||'—'}</div>
-        </div>
+        <div class="place-cell"><div class="place-label">Overall</div><div class="place-value" style="color:${placeColor(overallRatio)}">${medal(overallN)}${r.overall||'—'}</div></div>
+        <div class="place-cell"><div class="place-label">Sex</div><div class="place-value" style="color:${placeColor(sexRatio)}">${r.sex||'—'}</div></div>
+        <div class="place-cell"><div class="place-label">Age group</div><div class="place-value" style="color:${placeColor(ageRatio)}">${r.age||'—'}</div></div>
       </div>
       <div class="race-actions">
-        <button class="btn-edit-sm" onclick="openEdit('${r.id}')">Edit</button>
-        <button class="btn-del-sm" onclick="askDelete('${r.id}')">Delete</button>
+        <button class="btn-edit-sm" onclick="window._openEdit('${r._docId}')">Edit</button>
+        <button class="btn-del-sm" onclick="window._askDelete('${r._docId}')">Delete</button>
       </div>
     </div>`;
   }).join('');
 }
 
 // ── Filter ──
-function setFilter(d) { filterDist = d; render(); }
+window.setFilter = function(d) { filterDist = d; render(); }
 
 // ── Form ──
-function openForm() {
-  editId = null;
+window.openForm = function() {
+  editId = null; editDocId = null;
   document.getElementById('formTitle').textContent = 'Log a race';
   document.getElementById('f-name').value = '';
   document.getElementById('f-distance').value = '5K';
@@ -496,10 +544,11 @@ function openForm() {
   clearErrors();
   document.getElementById('formModal').style.display = 'flex';
 }
-function openEdit(id) {
-  const r = races.find(x=>x.id===id);
+
+window._openEdit = function(docId) {
+  const r = races.find(x=>x._docId===docId);
   if (!r) return;
-  editId = id;
+  editDocId = docId;
   document.getElementById('formTitle').textContent = 'Edit race';
   document.getElementById('f-name').value = r.name||'';
   document.getElementById('f-distance').value = r.distance||'5K';
@@ -513,8 +562,10 @@ function openEdit(id) {
   clearErrors();
   document.getElementById('formModal').style.display = 'flex';
 }
-function closeForm() { document.getElementById('formModal').style.display = 'none'; }
-function closeIfOutside(e) { if (e.target.id==='formModal') closeForm(); }
+
+window.closeForm = function() { document.getElementById('formModal').style.display = 'none'; }
+window.closeIfOutside = function(e) { if (e.target.id==='formModal') window.closeForm(); }
+
 function clearErrors() {
   document.getElementById('err-name').style.display = 'none';
   document.getElementById('err-time').style.display = 'none';
@@ -522,7 +573,7 @@ function clearErrors() {
   document.getElementById('f-time').style.borderColor = '';
 }
 
-function saveRace() {
+window.saveRace = async function() {
   clearErrors();
   const name = document.getElementById('f-name').value.trim();
   const dist = document.getElementById('f-distance').value;
@@ -548,30 +599,49 @@ function saveRace() {
   }
   if (!valid) return;
 
-  const r = { id: editId || (Date.now().toString(36)+Math.random().toString(36).slice(2,5)), name, distance:dist, date, year, time, pace, overall, sex, age, notes };
+  const btn = document.getElementById('btnSave');
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  setSyncStatus('syncing', 'Saving…');
 
-  if (editId) {
-    const i = races.findIndex(x=>x.id===editId);
-    if (i>=0) races[i] = r;
-  } else {
-    races.push(r);
+  const data = { name, distance: dist, date, year: String(year), time, pace, overall, sex, age, notes };
+
+  try {
+    if (editDocId) {
+      await updateDoc(doc(db, 'races', editDocId), data);
+    } else {
+      data.createdAt = Date.now();
+      await addDoc(racesCol, data);
+    }
+    window.closeForm();
+  } catch(e) {
+    console.error(e);
+    setSyncStatus('error', 'Save failed — check connection');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save race';
   }
-  save();
-  closeForm();
-  render();
 }
 
 // ── Delete ──
-function askDelete(id) { deleteId = id; document.getElementById('confirmModal').style.display = 'flex'; }
-function closeConfirm() { document.getElementById('confirmModal').style.display = 'none'; deleteId = null; }
-function confirmDelete() {
-  races = races.filter(r=>r.id!==deleteId);
-  save(); closeConfirm(); render();
+window._askDelete = function(docId) {
+  deleteDocId = docId;
+  document.getElementById('confirmModal').style.display = 'flex';
 }
-
-// ── Init ──
-load();
-render();
+window.closeConfirm = function() {
+  document.getElementById('confirmModal').style.display = 'none';
+  deleteDocId = null;
+}
+window.confirmDelete = async function() {
+  if (!deleteDocId) return;
+  setSyncStatus('syncing', 'Deleting…');
+  try {
+    await deleteDoc(doc(db, 'races', deleteDocId));
+  } catch(e) {
+    setSyncStatus('error', 'Delete failed');
+  }
+  window.closeConfirm();
+}
 </script>
 </body>
 </html>
